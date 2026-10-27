@@ -1,3 +1,7 @@
+
+
+
+
 import wordFilters from "./summaryWordFilters.json" with { type: "json" };
 
 const customWords = new Set(wordFilters.customWords);
@@ -143,6 +147,7 @@ function rankKeywords(text) {
 }
 
 export function summarizeTranscript(transcript) {
+	if (typeof transcript !== "string") return [];
 	const text = transcript.trim();
 	if (!text) return [];
 
@@ -152,10 +157,12 @@ export function summarizeTranscript(transcript) {
 }
 
 export function summarizeJourneyKeywords(transcripts) {
-	const allTranscriptText = transcripts
-		.filter((transcript) => typeof transcript === "string")
-		.join(" ")
-		.trim();
+	const allTranscriptText = Array.isArray(transcripts)
+		? transcripts
+			.filter((transcript) => typeof transcript === "string")
+			.join(" ")
+			.trim()
+		: "";
 	if (!allTranscriptText) return [];
 
 	return rankKeywords(allTranscriptText)
@@ -184,6 +191,7 @@ function splitIntoSentences(text) {
 }
 
 export function summarizeJourney(transcripts) {
+	if (!Array.isArray(transcripts)) return [];
 	const sourceSections = transcripts
 		.map((transcript, sectionIndex) => ({
 			sectionIndex,

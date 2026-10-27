@@ -10,13 +10,15 @@ const keywords = (text) => summarizeTranscript(text).map((word) => word.toLowerC
 const includesAny = (words, options) => options.some((word) => words.includes(word));
 
 test("prioritizes names over filler in transcript keywords", () => {
-	const words = keywords(
-		"Harry stopped in front of the desk and gazed down at his 15 year old. Excitement exploded in the pit of his stomach. It was as though he was looking at himself, but with deliberate mistake. James desires were Hazel. His nose was slightly longer than Harry's. And there was no sky on his forehead. But they have the same thin face, same mouth, same eyebrows. James's hair stuck up at the back, exactly as Harris did. His hands could have been Harry's when Harry could tell that when James stood up.",
-	);
-	assert(words.includes("harry"));
-	assert(words.includes("james"));
-	assert(!includesAny(words, ["the", "and", "stopped", "gazed", "looking"]));
-	assert(words.length <= 3);
+    const words = keywords(
+        "Albert Einstein and Marie Curie discussed physics while the audience listened carefully."
+    );
+
+    assert(words.includes("albert"));
+    assert(words.includes("einstein"));
+    assert(words.includes("curie"));
+    assert(!includesAny(words, ["and", "the", "while", "audience", "carefully"]));
+    assert(words.length <= 3);
 });
 
 test("ranks topics and excludes function words and generic verbs", () => {
@@ -58,6 +60,8 @@ test("limits consolidated keywords to twelve and ignores filler-only text", () =
 	});
 	assert.equal(summarizeJourneyKeywords(transcripts).length, 12);
 	assert.deepEqual(summarizeJourneyKeywords(["The and it you were.", ""]), []);
+	assert.deepEqual(summarizeTranscript(null), []);
+	assert.deepEqual(summarizeTranscript(undefined), []);
 });
 
 test("organizes original transcript sentences under distinct journey topics", () => {

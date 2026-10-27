@@ -7,15 +7,16 @@
 		"dev": "vite --open",
 		"build": "vite build",
 		"preview": "vite preview --open",
-		"start": "vite --open"
+		"start": "vite --open",
+		"test:supabase": "node scripts/supabase-smoke-test.js"
 	},
 	"dependencies": {
+		"@supabase/supabase-js": "^2.118.0",
 		"leaflet": "^1.9.4",
 		"react": "^19.0.0",
 		"react-dom": "^19.0.0"
 	},
 	"devDependencies": {
-		"@rollup/rollup-linux-x64-gnu": "^4.65.0",
 		"@vitejs/plugin-react": "^4.3.4",
 		"vite": "^6.0.0"
 	},

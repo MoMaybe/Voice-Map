@@ -1,0 +1,33 @@
+{
+	"id": "/",
+	"name": "Voice Map",
+	"short_name": "Voice Map",
+	"description": "Record walks, capture locations, and explore the stories along your route.",
+	"start_url": "/",
+	"scope": "/",
+	"display": "standalone",
+	"display_override": ["standalone", "minimal-ui"],
+	"orientation": "any",
+	"background_color": "#f6f5f0",
+	"theme_color": "#f6f5f0",
+	"icons": [
+		{
+			"src": "/icons/voice-map-192.png",
+			"sizes": "192x192",
+			"type": "image/png",
+			"purpose": "any"
+		},
+		{
+			"src": "/icons/voice-map-512.png",
+			"sizes": "512x512",
+			"type": "image/png",
+			"purpose": "any"
+		},
+		{
+			"src": "/icons/voice-map.svg",
+			"sizes": "any",
+			"type": "image/svg+xml",
+			"purpose": "maskable"
+		}
+	]
+}

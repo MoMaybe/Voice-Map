@@ -2,15 +2,26 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import L from "leaflet";
 import "leaflet/dist/leaflet.css";
 import "./app.css";
+import AuthPanel from "./AuthPanel.jsx";
 import { summarizeJourneyKeywords, summarizeTranscript } from "./summarizeTranscript.js";
+import { doesLineSegmentIntersectPolygon, summarizeAreaSegments } from "./areaSearch.js";
+import { getSegmentEndpoints } from "./spatialModel.js";
+import { createHeatmapLayer, segmentMatchesSearch } from "./heatmap.js";
+import {
+	deleteStory,
+	loadSavedStories,
+	renameSavedStory,
+	saveStory,
+} from "./storyStorage.js";
+import { supabase } from "./supabase.js";
 
-// This is the main screen of the app. It records audio, asks the browser
-// to turn speech into text, samples the device's location, and exports a CSV.
+// to turn speech into text, samples the device's location, and exports a GeoJSON.
 export default function App() {
 	// A ref is a small storage box that React keeps between screen updates.
 	// Unlike state, changing a ref does not redraw the screen. These refs are
 	// useful for browser objects and for checking the latest recording status.
 	const recorderRef = useRef(null);
+	const authSessionRef = useRef(null);
 	// The microphone stream lets us stop the microphone tracks when we're done.
 	const streamRef = useRef(null);
 	// The speech recognizer is a separate browser feature from audio recording.
@@ -36,33 +47,170 @@ export default function App() {
 	const transcriptSegmentsRef = useRef([]);
 	const mapElementRef = useRef(null);
 	const mapRef = useRef(null);
-	const markerLayerRef = useRef(null);
-	const routeLayerRef = useRef(null);
+	const segmentLayerRef = useRef(null);
+	const areaLayerRef = useRef(null);
+	const heatmapLayerRef = useRef(null);
 	const mapHasCenteredRef = useRef(false);
 	const recordingGenerationRef = useRef(0);
 	const audioBlobRef = useRef(null);
 	const audioBlobPromiseRef = useRef(Promise.resolve(null));
+	const storySaveRequestedRef = useRef(false);
+	const finalLocationPromiseRef = useRef(Promise.resolve(null));
 
 	// State is information shown on screen. Updating state tells React to redraw
 	// the parts of the page that depend on the changed value.
 	const [recording, setRecording] = useState(false);
 	const [paused, setPaused] = useState(false);
 	const [status, setStatus] = useState("Ready to record");
+	const [authSession, setAuthSession] = useState(null);
+	const [authLoaded, setAuthLoaded] = useState(false);
+	const [deferredInstallPrompt, setDeferredInstallPrompt] = useState(null);
+	const [installMessage, setInstallMessage] = useState("");
+	const [isInstalled, setIsInstalled] = useState(() =>
+		window.matchMedia?.("(display-mode: standalone)").matches
+		|| window.navigator.standalone === true,
+	);
+	const [isOnline, setIsOnline] = useState(() => navigator.onLine);
 	const [transcriptionStatus, setTranscriptionStatus] = useState("");
 	const [transcriptSegments, setTranscriptSegments] = useState([]);
 	const [transcriptHistory, setTranscriptHistory] = useState([]);
 	const [audioUrl, setAudioUrl] = useState("");
 	const [storyAudioUrl, setStoryAudioUrl] = useState("");
 	const [savingStory, setSavingStory] = useState(false);
-	const [selectedPoint, setSelectedPoint] = useState(null);
+	const [selectedSegment, setSelectedSegment] = useState(null);
 	const [journeyReady, setJourneyReady] = useState(false);
 	const [showStoryPrompt, setShowStoryPrompt] = useState(false);
+	const [storySaveError, setStorySaveError] = useState("");
 	const [savedStories, setSavedStories] = useState([]);
+	const [storiesLoaded, setStoriesLoaded] = useState(false);
+	const [storageStatus, setStorageStatus] = useState("");
 	const [storiesExpanded, setStoriesExpanded] = useState(false);
 	const [activePage, setActivePage] = useState("home");
+	const [mapKeywordSearch, setMapKeywordSearch] = useState("");
+	const [mapVisualization, setMapVisualization] = useState("segments");
+	const [areaDrawing, setAreaDrawing] = useState(false);
+	const [areaVertices, setAreaVertices] = useState([]);
 	const [selectedStoryId, setSelectedStoryId] = useState(null);
 	const [editingStoryId, setEditingStoryId] = useState(null);
 	const [storyTitleDraft, setStoryTitleDraft] = useState("");
+
+	const authUserId = authSession?.user?.id;
+
+	useEffect(() => {
+		const installMedia = window.matchMedia("(display-mode: standalone)");
+		const handleInstallPrompt = (event) => {
+			event.preventDefault();
+			setDeferredInstallPrompt(event);
+		};
+		const handleAppInstalled = () => {
+			setIsInstalled(true);
+			setDeferredInstallPrompt(null);
+			setInstallMessage("Voice Map is installed on this device.");
+		};
+		const updateInstalledState = () => setIsInstalled(installMedia.matches);
+		const updateOnlineState = () => setIsOnline(navigator.onLine);
+
+		window.addEventListener("beforeinstallprompt", handleInstallPrompt);
+		window.addEventListener("appinstalled", handleAppInstalled);
+		window.addEventListener("online", updateOnlineState);
+		window.addEventListener("offline", updateOnlineState);
+		installMedia.addEventListener("change", updateInstalledState);
+		return () => {
+			window.removeEventListener("beforeinstallprompt", handleInstallPrompt);
+			window.removeEventListener("appinstalled", handleAppInstalled);
+			window.removeEventListener("online", updateOnlineState);
+			window.removeEventListener("offline", updateOnlineState);
+			installMedia.removeEventListener("change", updateInstalledState);
+		};
+	}, []);
+
+	async function installApp() {
+		if (!deferredInstallPrompt) {
+			setInstallMessage("Use your browser menu and choose Install app or Add to Home Screen.");
+			return;
+		}
+		try {
+			await deferredInstallPrompt.prompt();
+			const { outcome } = await deferredInstallPrompt.userChoice;
+			setInstallMessage(outcome === "accepted"
+				? "Voice Map is being installed."
+				: "Installation was canceled.");
+			setDeferredInstallPrompt(null);
+		} catch (error) {
+			console.error("Could not start app installation.", error);
+			setInstallMessage(`Could not install Voice Map: ${error.message}`);
+		}
+	}
+
+	useEffect(() => {
+		let active = true;
+		const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, session) => {
+			if (!active) return;
+			if (authSessionRef.current?.user?.id !== session?.user?.id) {
+				setSavedStories([]);
+				setSelectedStoryId(null);
+				setStoriesLoaded(false);
+				mapHasCenteredRef.current = false;
+			}
+			authSessionRef.current = session;
+			setAuthSession(session);
+			setAuthLoaded(true);
+		});
+		supabase.auth.getSession()
+			.then(({ data, error }) => {
+				if (error) throw error;
+				if (!active) return;
+				authSessionRef.current = data.session;
+				setAuthSession(data.session);
+				setAuthLoaded(true);
+			})
+			.catch((error) => {
+				console.error("Could not check the current Supabase session.", error);
+				if (!active) return;
+				setAuthLoaded(true);
+				setStorageStatus(`Could not check sign-in status: ${error.message}`);
+			});
+		return () => {
+			active = false;
+			subscription.unsubscribe();
+		};
+	}, []);
+
+	useEffect(() => {
+		if (!authLoaded) return undefined;
+		if (!authUserId) {
+			setSavedStories([]);
+			setStoriesLoaded(true);
+			setSelectedStoryId(null);
+			setStorageStatus("Sign in to sync your stories. Audio stays on this device.");
+			return undefined;
+		}
+
+		let active = true;
+		setStoriesLoaded(false);
+		loadSavedStories(authUserId)
+			.then(({ stories, migratedCount, syncError }) => {
+				if (!active) return;
+				setSavedStories(stories);
+				setStoriesLoaded(true);
+				if (syncError) {
+					setStorageStatus(`Cloud sync failed: ${syncError.message}. Showing locally saved stories.`);
+				} else if (migratedCount > 0) {
+					setStorageStatus(`${migratedCount} local ${migratedCount === 1 ? "story was" : "stories were"} imported to your account. Audio stays on this device.`);
+				} else {
+					setStorageStatus("Stories sync to your account. Audio stays on this device.");
+				}
+			})
+			.catch((error) => {
+				console.error("Could not load saved recordings.", error);
+				if (!active) return;
+				setStoriesLoaded(true);
+				setStorageStatus(`Could not load saved recordings: ${error.message}`);
+			});
+		return () => {
+			active = false;
+		};
+	}, [authLoaded, authUserId]);
 
 	const selectedStory = savedStories.find((story) => story.id === selectedStoryId);
 	const selectedStoryKeywords = useMemo(
@@ -82,20 +230,66 @@ export default function App() {
 		[journeyReady, transcriptHistory, transcriptSegments],
 	);
 
-	const visibleSegments = activePage === "savedStories" && selectedStory
-		? selectedStory.segments
-		: transcriptSegments;
-	const mapPoints = useMemo(() => visibleSegments.flatMap((segment, index) => {
-		const text = `${segment.text}${segment.interim}`.trim();
-		if (!segment.complete || !segment.location || !text) return [];
-		return [{
-			index,
-			text,
-			location: segment.location,
-			summary: segment.summary || [],
-			summaryStatus: segment.summaryStatus || "",
-		}];
-	}), [visibleSegments]);
+	const mapSegments = useMemo(() => {
+		const savedStorySegments = savedStories.flatMap((story) => story.segments.flatMap((segment, index) => {
+			const text = `${segment.text}${segment.interim}`.trim();
+			const endpoints = getSegmentEndpoints(segment);
+			if (!segment.complete || !endpoints) return [];
+			const summary = segment.summary || [];
+			return [{
+				index,
+				storyId: story.id,
+				storyTitle: story.title,
+				text,
+				...endpoints,
+				summary,
+				summaryStatus: segment.summaryStatus || "",
+				matchesSearch: segmentMatchesSearch({ text, summary }, mapKeywordSearch),
+			}];
+		}));
+		if (activePage === "map") return savedStorySegments;
+
+		const visibleSegments = activePage === "savedStories" && selectedStory
+			? selectedStory.segments
+			: transcriptSegments;
+		const currentMapSegments = visibleSegments.flatMap((segment, index) => {
+			const text = `${segment.text}${segment.interim}`.trim();
+			const endpoints = getSegmentEndpoints(segment);
+			if (!segment.complete || !endpoints) return [];
+			return [{
+				index,
+				text,
+				...endpoints,
+				summary: segment.summary || [],
+				summaryStatus: segment.summaryStatus || "",
+				matchesSearch: false,
+			}];
+		});
+		return activePage === "home"
+			? [...savedStorySegments, ...currentMapSegments]
+			: currentMapSegments;
+	}, [activePage, mapKeywordSearch, savedStories, selectedStory, transcriptSegments]);
+
+	const matchingMapStories = useMemo(() => {
+		if (!mapKeywordSearch.trim()) return [];
+		return savedStories.filter((story) => story.segments.some((segment) =>
+			segment.complete
+			&& getSegmentEndpoints(segment)
+			&& segmentMatchesSearch({
+				text: `${segment.text}${segment.interim}`,
+				summary: segment.summary || [],
+			}, mapKeywordSearch),
+		));
+	}, [mapKeywordSearch, savedStories]);
+	const matchingMapSegmentCount = useMemo(
+		() => mapSegments.filter((segment) => segment.matchesSearch).length,
+		[mapSegments],
+	);
+
+	const segmentsInArea = useMemo(() => areaVertices.length >= 3
+		? mapSegments.filter((segment) => doesLineSegmentIntersectPolygon(segment, areaVertices))
+		: [], [areaVertices, mapSegments]);
+	const areaKeywords = useMemo(() => summarizeAreaSegments(segmentsInArea), [segmentsInArea]);
 
 	useEffect(() => {
 		if (!selectedStory?.audioBlob) {
@@ -107,7 +301,7 @@ export default function App() {
 		return () => URL.revokeObjectURL(url);
 	}, [selectedStory]);
 
-	useEffect(() => {
+useEffect(() => {
 		if (!mapElementRef.current || mapRef.current) return undefined;
 		const map = L.map(mapElementRef.current, { zoomControl: false }).setView([20, 0], 2);
 		L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
@@ -116,56 +310,113 @@ export default function App() {
 		}).addTo(map);
 		L.control.zoom({ position: "topright" }).addTo(map);
 		mapRef.current = map;
-		markerLayerRef.current = L.layerGroup().addTo(map);
-		routeLayerRef.current = L.layerGroup().addTo(map);
+		segmentLayerRef.current = L.layerGroup().addTo(map);
+		areaLayerRef.current = L.layerGroup().addTo(map);
+		heatmapLayerRef.current = createHeatmapLayer(L).addTo(map);
 
 		return () => {
 			map.remove();
 			mapRef.current = null;
-			markerLayerRef.current = null;
-			routeLayerRef.current = null;
+			segmentLayerRef.current = null;
+			areaLayerRef.current = null;
+			heatmapLayerRef.current = null;
 		};
 	}, []);
 
 	useEffect(() => {
-		if (!mapRef.current || !markerLayerRef.current || !routeLayerRef.current) return;
-		markerLayerRef.current.clearLayers();
-		routeLayerRef.current.clearLayers();
-		if ((journeyReady || (activePage === "savedStories" && selectedStory)) && mapPoints.length > 1) {
-			L.polyline(
-				mapPoints.map(({ location }) => [location.latitude, location.longitude]),
+		const map = mapRef.current;
+		if (!map || activePage !== "map") return undefined;
+		const handleMapClick = (event) => {
+			if (!areaDrawing) return;
+			setAreaVertices((vertices) => [
+				...vertices,
+				{ latitude: event.latlng.lat, longitude: event.latlng.lng },
+			]);
+		};
+		map.on("click", handleMapClick);
+		if (areaDrawing) map.doubleClickZoom.disable();
+		else map.doubleClickZoom.enable();
+		return () => {
+			map.off("click", handleMapClick);
+			map.doubleClickZoom.enable();
+		};
+	}, [activePage, areaDrawing]);
+
+	useEffect(() => {
+		const areaLayer = areaLayerRef.current;
+		if (!areaLayer) return;
+		areaLayer.clearLayers();
+		if (areaVertices.length > 0) {
+			const latLngs = areaVertices.map(({ latitude, longitude }) => [latitude, longitude]);
+			if (areaVertices.length >= 3) {
+				L.polygon(latLngs, {
+					color: "#a34f2d",
+					weight: 3,
+					fillColor: "#d97745",
+					fillOpacity: 0.18,
+					interactive: false,
+				}).addTo(areaLayer);
+			} else {
+				L.polyline(latLngs, {
+					color: "#a34f2d",
+					weight: 3,
+					dashArray: "6 6",
+					interactive: false,
+				}).addTo(areaLayer);
+			}
+			latLngs.forEach((latLng) => {
+				L.circleMarker(latLng, {
+					radius: 5,
+					color: "#ffffff",
+					weight: 2,
+					fillColor: "#a34f2d",
+					fillOpacity: 1,
+					interactive: false,
+				}).addTo(areaLayer);
+			});
+		}
+	}, [areaVertices]);
+
+	useEffect(() => {
+		const segmentLayer = segmentLayerRef.current;
+		const heatmapLayer = heatmapLayerRef.current;
+		if (!mapRef.current || !segmentLayer) return;
+		const isHeatmapMode = activePage === "map" && mapVisualization === "heatmap";
+		heatmapLayer?.setSegments(mapSegments.filter((segment) => segment.matchesSearch));
+		heatmapLayer?.setVisible(isHeatmapMode && Boolean(mapKeywordSearch.trim()));
+		segmentLayer.clearLayers();
+		if (isHeatmapMode) return;
+		const isSavedStory = activePage === "savedStories" && Boolean(selectedStory);
+		mapSegments.forEach((segment) => {
+			const isMapSearch = activePage === "map" && Boolean(mapKeywordSearch.trim());
+			const lineColor = isSavedStory
+				? "#d97745"
+				: isMapSearch
+					? segment.matchesSearch ? "#d97745" : "#9ba39d"
+					: "#18794e";
+			const line = L.polyline(
+				[
+					[segment.startLocation.latitude, segment.startLocation.longitude],
+					[segment.endLocation.latitude, segment.endLocation.longitude],
+				],
 				{
-					color: "#d27a4c",
-					weight: 4,
-					opacity: 0.85,
+					color: lineColor,
+					weight: segment.matchesSearch || isSavedStory ? 6 : 5,
+					opacity: isMapSearch && !segment.matchesSearch ? 0.55 : 0.9,
 					lineCap: "round",
 					lineJoin: "round",
 				},
-			).addTo(routeLayerRef.current);
-		}
-
-		const isStoryPoint = activePage === "savedStories" && Boolean(selectedStory);
-		mapPoints.forEach((point) => {
-			const marker = L.circleMarker(
-				[point.location.latitude, point.location.longitude],
-				{
-					radius: isStoryPoint ? 12 : 9,
-					color: "#ffffff",
-					weight: isStoryPoint ? 4 : 3,
-					fillColor: isStoryPoint ? "#d97745" : "#18794e",
-					fillOpacity: 1,
-				},
-			).addTo(markerLayerRef.current);
+			).addTo(segmentLayerRef.current);
 			const popupContent = document.createElement("div");
 			popupContent.className = "transcript-popup";
 			const title = document.createElement("strong");
 			title.className = "transcript-popup-title";
-			title.textContent = `Voice note ${point.index + 1} · Main words`;
+			title.textContent = `${segment.storyTitle ? `${segment.storyTitle} · ` : ""}Interval ${segment.index + 1} · Main words`;
 			popupContent.append(title);
-			if (point.summary.length > 0) {
+			if (segment.summary.length > 0) {
 				const list = document.createElement("ul");
-				list.className = "transcript-popup-points";
-				point.summary.forEach((summaryPoint) => {
+				list.className = "transcript-popup-keywords";
+				segment.summary.forEach((summaryPoint) => {
 					const item = document.createElement("li");
 					item.textContent = summaryPoint;
 					list.append(item);
@@ -174,29 +425,33 @@ export default function App() {
 			} else {
 				const summaryStatus = document.createElement("p");
 				summaryStatus.className = "transcript-popup-status";
-				summaryStatus.textContent = point.summaryStatus || "No transcript to summarize.";
+				summaryStatus.textContent = segment.summaryStatus || (segment.text
+					? "No keywords found in this transcript."
+					: "No transcript was captured during this interval.");
 				popupContent.append(summaryStatus);
 			}
-			const fullTranscript = document.createElement("details");
-			fullTranscript.className = "transcript-popup-details";
-			const detailsLabel = document.createElement("summary");
-			detailsLabel.textContent = "View full transcript";
-			const transcript = document.createElement("p");
-			transcript.className = "transcript-popup-text";
-			transcript.textContent = point.text;
-			fullTranscript.append(detailsLabel, transcript);
-			popupContent.append(fullTranscript);
+			if (segment.text) {
+				const fullTranscript = document.createElement("details");
+				fullTranscript.className = "transcript-popup-details";
+				const detailsLabel = document.createElement("summary");
+				detailsLabel.textContent = "View full transcript";
+				const transcript = document.createElement("p");
+				transcript.className = "transcript-popup-text";
+				transcript.textContent = segment.text;
+				fullTranscript.append(detailsLabel, transcript);
+				popupContent.append(fullTranscript);
+			}
 
 			let hovered = false;
 			let pinned = false;
 			let closeTimeout = null;
-			const popup = marker.bindPopup(popupContent, {
+			const popup = line.bindPopup(popupContent, {
 				autoClose: true,
 				closeButton: true,
 				closeOnClick: true,
 				className: "transcript-map-popup",
 				maxWidth: 320,
-				offset: [0, -8],
+				offset: [0, -5],
 			});
 			const cancelClose = () => {
 				if (closeTimeout) window.clearTimeout(closeTimeout);
@@ -205,7 +460,7 @@ export default function App() {
 			const closeOnPointerLeave = () => {
 				cancelClose();
 				closeTimeout = window.setTimeout(() => {
-					if (!hovered && !pinned) marker.closePopup();
+					if (!hovered && !pinned) line.closePopup();
 				}, 120);
 			};
 			popupContent.addEventListener("mouseenter", () => {
@@ -217,20 +472,20 @@ export default function App() {
 				closeOnPointerLeave();
 			});
 
-			marker.on("mouseover", () => {
+			line.on("mouseover", () => {
 				hovered = true;
 				cancelClose();
-				marker.openPopup();
+				line.openPopup();
 			});
-			marker.on("mouseout", () => {
+			line.on("mouseout", () => {
 				hovered = false;
 				closeOnPointerLeave();
 			});
-			marker.on("click", () => {
+			line.on("click", () => {
 				pinned = true;
 				cancelClose();
-				marker.openPopup();
-				setSelectedPoint(point);
+				line.openPopup();
+				setSelectedSegment(segment);
 			});
 			popup.on("popupclose", () => {
 				pinned = false;
@@ -239,20 +494,44 @@ export default function App() {
 			});
 		});
 
-		if (mapPoints.length > 0 && activePage === "savedStories" && selectedStory) {
-			const points = mapPoints.map(({ location }) => [location.latitude, location.longitude]);
-			if (points.length > 1) {
-				mapRef.current.fitBounds(points, { padding: [40, 40], maxZoom: 14 });
-			} else {
-				mapRef.current.setView(points[0], 14);
+		const frameSegments = (segments) => {
+			const coordinates = segments.flatMap(({ startLocation, endLocation }) => [
+				[startLocation.latitude, startLocation.longitude],
+				[endLocation.latitude, endLocation.longitude],
+			]);
+			const [firstCoordinate] = coordinates;
+			const hasSpread = coordinates.some(([latitude, longitude]) =>
+				latitude !== firstCoordinate[0] || longitude !== firstCoordinate[1],
+			);
+			if (hasSpread) {
+				mapRef.current.fitBounds(coordinates, { padding: [40, 40], maxZoom: 14 });
+			} else if (firstCoordinate) {
+				mapRef.current.setView(firstCoordinate, 14);
 			}
+		};
+		if (mapSegments.length > 0 && activePage === "map") {
+			const matchingSegments = mapSegments.filter((segment) => segment.matchesSearch);
+			frameSegments(matchingSegments.length > 0 ? matchingSegments : mapSegments);
 			mapHasCenteredRef.current = true;
-		} else if (mapPoints.length > 0 && !mapHasCenteredRef.current) {
-			const latestPoint = mapPoints[mapPoints.length - 1];
-			mapRef.current.setView([latestPoint.location.latitude, latestPoint.location.longitude], 14);
+		} else if (mapSegments.length > 0 && activePage === "savedStories" && selectedStory) {
+			frameSegments(mapSegments);
+			mapHasCenteredRef.current = true;
+		} else if (
+			mapSegments.length > 0
+			&& activePage === "home"
+			&& (journeyReady || !mapHasCenteredRef.current)
+		) {
+			frameSegments(mapSegments);
+			mapHasCenteredRef.current = true;
+		} else if (mapSegments.length > 0 && !mapHasCenteredRef.current) {
+			const latestSegment = mapSegments[mapSegments.length - 1];
+			mapRef.current.setView([
+				latestSegment.endLocation.latitude,
+				latestSegment.endLocation.longitude,
+			], 14);
 			mapHasCenteredRef.current = true;
 		}
-	}, [activePage, journeyReady, mapPoints, selectedStory]);
+	}, [activePage, journeyReady, mapKeywordSearch, mapSegments, mapVisualization, selectedStory]);
 
 	// This cleanup runs when the screen is removed and when a saved audio URL
 	// is replaced. It prevents leftover timers, microphone access, and file URLs.
@@ -324,7 +603,8 @@ export default function App() {
 			text: "",
 			interim: "",
 			complete: false,
-			location: null,
+			startLocation: null,
+			endLocation: null,
 			locationStatus: !navigator.geolocation
 				? "Location is not supported in this browser."
 				: locationPermissionDeniedRef.current
@@ -339,7 +619,7 @@ export default function App() {
 
 	// Ask the browser for the device's current location and attach the answer
 	// (or an error message) to the matching transcript section.
-	function updateLocation(segmentIndex, requestId) {
+	function updateLocation(segmentIndex, requestId, isIntervalBoundary = false) {
 		if (!navigator.geolocation || locationPermissionDeniedRef.current) {
 			return;
 		}
@@ -349,14 +629,22 @@ export default function App() {
 				// Ignore answers from an older recording, but allow a slow location
 				// lookup to finish after Stop so its transcript can still be pinned.
 				if (requestId !== locationRequestIdRef.current) return;
+				const location = {
+					latitude: position.coords.latitude,
+					longitude: position.coords.longitude,
+				};
 				updateTranscriptSegment(segmentIndex, (segment) => ({
 					...segment,
-					location: {
-						latitude: position.coords.latitude,
-						longitude: position.coords.longitude,
-					},
-					locationStatus: "Location updated.",
+					startLocation: location,
+					locationStatus: "Interval start location captured.",
 				}));
+				if (isIntervalBoundary && segmentIndex > 0) {
+					updateTranscriptSegment(segmentIndex - 1, (segment) => ({
+						...segment,
+						endLocation: location,
+						locationStatus: "Interval start and end locations captured.",
+					}));
+				}
 			},
 			(error) => {
 				if (requestId !== locationRequestIdRef.current) return;
@@ -367,12 +655,11 @@ export default function App() {
 					3: "Getting your location timed out; will try again.",
 				};
 				// Location errors are kept with the relevant time section too,
-				// so the CSV can explain why coordinates are missing.
+				// so the GeoJSON can explain why coordinates are missing.
 				updateTranscriptSegment(segmentIndex, (segment) => ({
 					...segment,
 					locationStatus: messages[error.code] || `Could not get location: ${error.message}`,
 				}));
-				
 
 				// A denied permission will not become available by retrying.
 				// Keep creating transcript intervals, but stop requesting location.
@@ -382,6 +669,48 @@ export default function App() {
 			},
 			{ enableHighAccuracy: true, maximumAge: 0, timeout: 10000 },
 		);
+	}
+
+	function requestEndLocation(segmentIndex, requestId) {
+		if (!navigator.geolocation || locationPermissionDeniedRef.current) {
+			return Promise.resolve(null);
+		}
+
+		return new Promise((resolve) => {
+			navigator.geolocation.getCurrentPosition(
+				(position) => {
+					const location = {
+						latitude: position.coords.latitude,
+						longitude: position.coords.longitude,
+					};
+					if (requestId === locationRequestIdRef.current) {
+						updateTranscriptSegment(segmentIndex, (segment) => ({
+							...segment,
+							startLocation: segment.startLocation || location,
+							endLocation: location,
+							locationStatus: "Interval start and end locations captured.",
+						}));
+					}
+					resolve(location);
+				},
+				(error) => {
+					if (requestId === locationRequestIdRef.current) {
+						const messages = {
+							1: "Location permission was denied.",
+							2: "Your current location is unavailable.",
+							3: "Could not capture the interval end location before timeout.",
+						};
+						updateTranscriptSegment(segmentIndex, (segment) => ({
+							...segment,
+							locationStatus: messages[error.code] || `Could not get location: ${error.message}`,
+						}));
+						if (error.code === 1) locationPermissionDeniedRef.current = true;
+					}
+					resolve(null);
+				},
+				{ enableHighAccuracy: true, maximumAge: 0, timeout: 10000 },
+			);
+		});
 	}
 
 	// Get location immediately, then create a fresh transcript/location section
@@ -397,7 +726,7 @@ export default function App() {
 		const elapsedSegmentIndex = Math.floor(getActiveElapsedMs() / 30000);
 		while (transcriptSegmentsRef.current.length <= elapsedSegmentIndex) {
 			const segmentIndex = createTranscriptSegment();
-			updateLocation(segmentIndex, requestId);
+			updateLocation(segmentIndex, requestId, true);
 		}
 		const elapsedInSegment = getActiveElapsedMs() % 30000;
 		const remainingMs = 30000 - elapsedInSegment;
@@ -409,58 +738,157 @@ export default function App() {
 		}, remainingMs);
 	}
 
-	// Turn all transcript sections into a downloadable spreadsheet file.
-	function downloadTranscriptCsv() {
-		// Round the recording length up to a whole second for the last row's end time.
+	// Turn all transcript sections into a downloadable GeoJSON file.
+	function downloadTranscriptGeoJson() {
 		const elapsedSeconds = Math.max(0, Math.ceil(getActiveElapsedMs() / 1000));
-		// CSV files use commas to separate cells. Wrap each value in quotes and
-		// double any quotes inside it so punctuation in speech stays in one cell.
-		// The leading apostrophe also prevents spreadsheet formulas from running.
-		const escapeCsvCell = (value) => {
-			const text = String(value ?? "");
-			const safeText = /^[\t\r ]*[=+\-@]/.test(text) ? `'${text}` : text;
-			return `"${safeText.replaceAll('"', '""')}"`;
+		const featureCollection = {
+			type: "FeatureCollection",
+			features: transcriptSegmentsRef.current.map((segment, index) => {
+				const transcriptText = `${segment.text}${segment.interim}`.trim();
+				const endpoints = getSegmentEndpoints(segment);
+				return {
+					type: "Feature",
+					geometry: endpoints
+						? {
+							type: "LineString",
+							coordinates: [
+								[endpoints.startLocation.longitude, endpoints.startLocation.latitude],
+								[endpoints.endLocation.longitude, endpoints.endLocation.latitude],
+							],
+						}
+						: null,
+					properties: {
+						recording_started_at: new Date(recordingStartedAtRef.current).toISOString(),
+						interval_start_seconds: index * 30,
+						interval_end_seconds: Math.min((index + 1) * 30, elapsedSeconds),
+						transcript: transcriptText,
+						location_status: segment.locationStatus,
+						start_latitude: endpoints?.startLocation.latitude ?? null,
+						start_longitude: endpoints?.startLocation.longitude ?? null,
+						end_latitude: endpoints?.endLocation.latitude ?? null,
+						end_longitude: endpoints?.endLocation.longitude ?? null,
+						keywords: segment.summary || summarizeTranscript(transcriptText),
+					},
+				};
+			}),
 		};
-		const rows = [
-			// These are the column titles shown when the CSV opens in a spreadsheet.
-			[
-				"recording_started_at",
-				"interval_start_seconds",
-				"interval_end_seconds",
-				"transcript",
-				"latitude",
-				"longitude",
-				"location_status",
-			],
-			// Make one row per time section, including a blank coordinate if
-			// the browser could not provide a location.
-			...transcriptSegmentsRef.current.map((segment, index) => [
-				new Date(recordingStartedAtRef.current).toISOString(),
-				index * 30,
-				Math.min((index + 1) * 30, elapsedSeconds),
-				`${segment.text}${segment.interim}`,
-				segment.location?.latitude ?? "",
-				segment.location?.longitude ?? "",
-				segment.locationStatus,
-			]),
-		];
-		// The BOM helps spreadsheet apps recognize the file's text encoding.
-		const csv = `\uFEFF${rows.map((row) => row.map(escapeCsvCell).join(",")).join("\r\n")}`;
-		// Browsers download a temporary file URL rather than saving directly
-		// into a folder chosen by the app.
-		const fileUrl = URL.createObjectURL(new Blob([csv], { type: "text/csv;charset=utf-8" }));
+		const geoJson = JSON.stringify(featureCollection, null, 2);
+		const fileUrl = URL.createObjectURL(new Blob([geoJson], { type: "application/geo+json;charset=utf-8" }));
 		const link = document.createElement("a");
-		// Use the recording's date and time to make each downloaded filename unique.
 		const fileTimestamp = new Date(recordingStartedAtRef.current)
 			.toISOString()
 			.replaceAll(":", "-");
 		link.href = fileUrl;
-		link.download = `transcript-${fileTimestamp}.csv`;
+		link.download = `transcript-${fileTimestamp}.geojson`;
 		document.body.appendChild(link);
 		link.click();
 		link.remove();
-		// Free the temporary URL after the browser has had time to start the download.
 		window.setTimeout(() => URL.revokeObjectURL(fileUrl), 1000);
+	}
+
+	function downloadSavedStoriesGeoJson() {
+		const featureCollection = {
+			type: "FeatureCollection",
+			features: savedStories.flatMap((story) =>
+				story.segments.flatMap((segment, index) => {
+					const text = `${segment.text}${segment.interim}`.trim();
+					const endpoints = getSegmentEndpoints(segment);
+					if (!segment.complete || !endpoints) return [];
+					return [{
+						type: "Feature",
+						geometry: {
+							type: "LineString",
+							coordinates: [
+								[endpoints.startLocation.longitude, endpoints.startLocation.latitude],
+								[endpoints.endLocation.longitude, endpoints.endLocation.latitude],
+							],
+						},
+						properties: {
+							recording_id: story.id,
+							recording_title: story.title,
+							recording_started_at: story.recordingStartedAt,
+							interval_start_seconds: index * 30,
+							interval_end_seconds: Math.min((index + 1) * 30, story.durationSeconds),
+							transcript: text,
+							start_latitude: endpoints.startLocation.latitude,
+							start_longitude: endpoints.startLocation.longitude,
+							end_latitude: endpoints.endLocation.latitude,
+							end_longitude: endpoints.endLocation.longitude,
+							keywords: segment.summary || summarizeTranscript(text),
+						},
+					}];
+				}),
+			),
+		};
+		const geoJson = JSON.stringify(featureCollection, null, 2);
+		const fileUrl = URL.createObjectURL(new Blob([geoJson], { type: "application/geo+json;charset=utf-8" }));
+		const link = document.createElement("a");
+		link.href = fileUrl;
+		link.download = "voice-map-saved-recordings.geojson";
+		document.body.appendChild(link);
+		link.click();
+		link.remove();
+		window.setTimeout(() => URL.revokeObjectURL(fileUrl), 1000);
+	}
+
+	function downloadAreaGeoJson() {
+		if (areaVertices.length < 3) return;
+		const polygonCoordinates = areaVertices.map(({ latitude, longitude }) => [longitude, latitude]);
+		polygonCoordinates.push(polygonCoordinates[0]);
+		const featureCollection = {
+			type: "FeatureCollection",
+			features: [
+				{
+					type: "Feature",
+					geometry: { type: "Polygon", coordinates: [polygonCoordinates] },
+					properties: {
+						type: "selected_area",
+						matching_segment_count: segmentsInArea.length,
+						keywords: areaKeywords,
+					},
+				},
+				...segmentsInArea.map((segment) => ({
+					type: "Feature",
+					geometry: {
+						type: "LineString",
+						coordinates: [
+							[segment.startLocation.longitude, segment.startLocation.latitude],
+							[segment.endLocation.longitude, segment.endLocation.latitude],
+						],
+					},
+					properties: {
+						recording_id: segment.storyId,
+						recording_title: segment.storyTitle,
+						interval_number: segment.index + 1,
+						transcript: segment.text,
+						keywords: segment.summary.length
+							? segment.summary
+							: summarizeTranscript(segment.text),
+					},
+				})),
+			],
+		};
+		const fileUrl = URL.createObjectURL(new Blob(
+			[JSON.stringify(featureCollection, null, 2)],
+			{ type: "application/geo+json;charset=utf-8" },
+		));
+		const link = document.createElement("a");
+		link.href = fileUrl;
+		link.download = "voice-map-area-search.geojson";
+		document.body.appendChild(link);
+		link.click();
+		link.remove();
+		window.setTimeout(() => URL.revokeObjectURL(fileUrl), 1000);
+	}
+
+	function startAreaDrawing() {
+		setAreaVertices([]);
+		setAreaDrawing(true);
+	}
+
+	function clearArea() {
+		setAreaVertices([]);
+		setAreaDrawing(false);
 	}
 
 	// Start the browser's speech-to-text feature. This is different from saving
@@ -628,16 +1056,18 @@ export default function App() {
 				// The browser delivers audio in pieces; keep each non-empty piece.
 				if (event.data.size > 0) chunks.push(event.data);
 			});
-			recorder.addEventListener("stop", () => {
+			recorder.addEventListener("stop", async () => {
 				// Combine the audio pieces into one playable recording.
 				const blob = new Blob(chunks, { type: recorder.mimeType || "audio/webm" });
 				audioBlobRef.current = blob;
 				resolveAudioBlob(blob);
-				setAudioUrl((previousUrl) => {
-					// Free the previous playback URL before replacing it.
-					if (previousUrl) URL.revokeObjectURL(previousUrl);
-					return URL.createObjectURL(blob);
-				});
+				if (!storySaveRequestedRef.current) {
+					setAudioUrl((previousUrl) => {
+						// Free the previous playback URL before replacing it.
+						if (previousUrl) URL.revokeObjectURL(previousUrl);
+						return URL.createObjectURL(blob);
+					});
+				}
 				stream.getTracks().forEach((track) => track.stop());
 				streamRef.current = null;
 				recorderRef.current = null;
@@ -646,18 +1076,24 @@ export default function App() {
 				recognitionRef.current = null;
 				recognitionActiveRef.current = false;
 				try {
-					// Stopping also creates the CSV download.
-					downloadTranscriptCsv();
-					setStatus("Recording and transcript CSV saved. Play the audio below.");
+					// Stopping also creates the GeoJSON download.
+					if (!storySaveRequestedRef.current) {
+						await finalLocationPromiseRef.current;
+					}
+					if (!storySaveRequestedRef.current) downloadTranscriptGeoJson();
+					if (!storySaveRequestedRef.current) {
+						setStatus("Recording and transcript GeoJSON saved. Play the audio below.");
+					}
 				} catch (error) {
-					console.error("Could not download the transcript CSV.", error);
-					setStatus("Recording saved, but the transcript CSV could not be downloaded.");
+					console.error("Could not download the transcript GeoJSON.", error);
+					setStatus("Recording saved, but the transcript GeoJSON could not be downloaded.");
 				}
 			});
 
 			// Start audio capture first, then initialize speech recognition.
 			recorder.start();
 			audioBlobRef.current = null;
+			storySaveRequestedRef.current = false;
 			recordingRef.current = true;
 			pausedRef.current = false;
 			recordingGenerationRef.current += 1;
@@ -676,7 +1112,7 @@ export default function App() {
 			// Keep the live transcript and map scoped to this recording.
 			transcriptSegmentsRef.current = [];
 			setTranscriptSegments([]);
-			setSelectedPoint(null);
+			setSelectedSegment(null);
 			setSelectedStoryId(null);
 			setActivePage("home");
 			setJourneyReady(false);
@@ -685,8 +1121,9 @@ export default function App() {
 			recordingStartedAtRef.current = Date.now();
 			activeElapsedMsRef.current = 0;
 			activeStartedAtRef.current = recordingStartedAtRef.current;
-			createTranscriptSegment();
 			locationPermissionDeniedRef.current = false;
+			finalLocationPromiseRef.current = Promise.resolve(null);
+			createTranscriptSegment();
 			// New location callbacks use this ID; Stop changes it to invalidate them.
 			locationRequestIdRef.current += 1;
 			setStatus("Recording...");
@@ -771,7 +1208,12 @@ export default function App() {
 		}
 		recognitionRef.current = null;
 		recognitionActiveRef.current = false;
-		finalizeTranscriptSegment(transcriptSegmentsRef.current.length - 1);
+		const lastSegmentIndex = transcriptSegmentsRef.current.length - 1;
+		finalLocationPromiseRef.current = requestEndLocation(
+			lastSegmentIndex,
+			locationRequestIdRef.current,
+		);
+		finalizeTranscriptSegment(lastSegmentIndex);
 		setJourneyReady(true);
 		if (recorderRef.current && recorderRef.current.state !== "inactive") {
 			// Stopping the recorder triggers its "stop" event, which assembles
@@ -786,49 +1228,118 @@ export default function App() {
 	}
 
 	async function addStoryToMap() {
+		setStorySaveError("");
+		if (!authUserId) {
+			setStorySaveError("Sign in before saving a recording to your account.");
+			const emailField = document.getElementById("account-email");
+			emailField?.scrollIntoView({ behavior: "smooth", block: "center" });
+			emailField?.focus({ preventScroll: true });
+			return;
+		}
 		setSavingStory(true);
-		const audioBlob = audioBlobRef.current || await audioBlobPromiseRef.current;
-		const segments = transcriptSegmentsRef.current.map((segment) => ({ ...segment }));
-		const text = segments
-			.map((segment) => `${segment.text}${segment.interim}`.trim())
-			.filter(Boolean)
-			.join("\n\n");
-		const storyNumber = savedStories.length + 1;
-		const storyNumberWords = [
-			"One", "Two", "Three", "Four", "Five", "Six", "Seven", "Eight", "Nine", "Ten",
-			"Eleven", "Twelve", "Thirteen", "Fourteen", "Fifteen", "Sixteen", "Seventeen",
-			"Eighteen", "Nineteen", "Twenty",
-		];
-		const id = `${Date.now()}-${storyNumber}`;
-		setSavedStories((stories) => [
-			...stories,
-			{
+		try {
+			await finalLocationPromiseRef.current;
+			const audioBlob = audioBlobRef.current || await audioBlobPromiseRef.current;
+			const segments = transcriptSegmentsRef.current.map((segment) => ({ ...segment }));
+			const text = segments
+				.map((segment) => `${segment.text}${segment.interim}`.trim())
+				.filter(Boolean)
+				.join("\n\n");
+			const storyNumber = savedStories.length + 1;
+			const storyNumberWords = [
+				"One", "Two", "Three", "Four", "Five", "Six", "Seven", "Eight", "Nine", "Ten",
+				"Eleven", "Twelve", "Thirteen", "Fourteen", "Fifteen", "Sixteen", "Seventeen",
+				"Eighteen", "Nineteen", "Twenty",
+			];
+			const id = `${Date.now()}-${storyNumber}`;
+			const story = {
 				id,
 				title: `Story ${storyNumberWords[storyNumber - 1] || storyNumber}`,
 				text,
 				segments,
 				audioBlob,
-			},
-		]);
-		setSelectedStoryId(null);
-		setActivePage("savedStories");
-		setShowStoryPrompt(false);
-		setSavingStory(false);
+				recordingStartedAt: new Date(recordingStartedAtRef.current).toISOString(),
+				durationSeconds: Math.max(0, Math.ceil(activeElapsedMsRef.current / 1000)),
+			};
+			storySaveRequestedRef.current = true;
+			await saveStory(story, authUserId);
+			setSavedStories((stories) => [...stories, { ...story, cloudStored: true }]);
+			setSelectedStoryId(story.id);
+			setActivePage("savedStories");
+			transcriptSegmentsRef.current = [];
+			setTranscriptSegments([]);
+			setTranscriptHistory([]);
+			setJourneyReady(false);
+			setSelectedSegment(null);
+			setTranscriptionStatus("");
+			setAudioUrl("");
+			setStatus("Story saved to your account. Audio stays on this device.");
+			setStorageStatus("Story and transcript saved to your account; audio stays on this device.");
+			setShowStoryPrompt(false);
+		} catch (error) {
+			console.error("Could not save the recording.", error);
+			setStorySaveError(`Could not save this recording: ${error.message}`);
+			setStorageStatus(`Could not save this recording: ${error.message}`);
+			setStatus("Could not save the recording to your account.");
+		} finally {
+			setSavingStory(false);
+		}
 	}
 
-	function renameStory(event) {
+	async function renameStory(event) {
 		event.preventDefault();
 		const title = storyTitleDraft.trim();
 		if (!title) return;
-		setSavedStories((stories) => stories.map((story) =>
-			story.id === editingStoryId ? { ...story, title } : story,
-		));
-		setEditingStoryId(null);
-		setStoryTitleDraft("");
+		const story = savedStories.find((savedStory) => savedStory.id === editingStoryId);
+		if (!story) return;
+		const renamedStory = { ...story, title };
+		try {
+			await renameSavedStory(story.id, title, authUserId);
+			setSavedStories((stories) => stories.map((savedStory) =>
+				savedStory.id === editingStoryId ? renamedStory : savedStory,
+			));
+			setEditingStoryId(null);
+			setStoryTitleDraft("");
+			setStorageStatus("Story name updated in your account.");
+		} catch (error) {
+			console.error("Could not rename the saved recording.", error);
+			setStorageStatus(`Could not update the story name: ${error.message}`);
+		}
+	}
+
+	async function deleteSavedStory(story) {
+		if (!window.confirm(`Delete "${story.title}" and its saved audio from this device? This cannot be undone.`)) return;
+		try {
+			await deleteStory(story.id, authUserId);
+			setSavedStories((stories) => stories.filter((savedStory) => savedStory.id !== story.id));
+			if (selectedStoryId === story.id) setSelectedStoryId(null);
+			setStorageStatus("Recording and transcript deleted from your account and this device.");
+		} catch (error) {
+			console.error("Could not delete the saved recording.", error);
+			setStorageStatus(`Could not delete the recording: ${error.message}`);
+		}
+	}
+
+	function discardRecording() {
+		storySaveRequestedRef.current = true;
+		setShowStoryPrompt(false);
+		setJourneyReady(false);
+		setSelectedSegment(null);
+		transcriptSegmentsRef.current = [];
+		setTranscriptSegments([]);
+		setTranscriptHistory([]);
+		setAudioUrl("");
+		audioBlobRef.current = null;
+		setStatus("Recording discarded.");
 	}
 
 	function closeStoryDetails() {
 		setSelectedStoryId(null);
+	}
+
+	function openSavedStory(storyId) {
+		setSelectedStoryId(storyId);
+		setActivePage("savedStories");
 	}
 
 	return (
@@ -841,6 +1352,20 @@ export default function App() {
 						<p className="sidebar-title">Voice map</p>
 					</div>
 				</div>
+				<AuthPanel session={authSession} loading={!authLoaded} />
+				{!isInstalled && (
+					<section className="pwa-install-panel" aria-label="Install Voice Map">
+						<button type="button" onClick={installApp}>
+							Install Voice Map
+						</button>
+						{installMessage && <p role="status">{installMessage}</p>}
+					</section>
+				)}
+				{!isOnline && (
+					<p className="pwa-offline-notice" role="status">
+						Offline: the app shell and on-device audio remain available. Sign-in, cloud sync, and live map tiles need internet.
+					</p>
+				)}
 				<nav className="sidebar-navigation" aria-label="Main navigation">
 					<button
 						type="button"
@@ -850,7 +1375,15 @@ export default function App() {
 					>
 						Home
 					</button>
-					<button type="button" className="sidebar-button" disabled>
+					<button
+						type="button"
+						className={`sidebar-button${activePage === "map" ? " is-active" : ""}`}
+						aria-current={activePage === "map" ? "page" : undefined}
+						onClick={() => {
+							setSelectedStoryId(null);
+							setActivePage("map");
+						}}
+					>
 						Map
 					</button>
 					<button
@@ -862,6 +1395,126 @@ export default function App() {
 						Saved Stories
 					</button>
 				</nav>
+				<p className="sidebar-storage-status" role="status">
+					{storiesLoaded ? storageStatus : "Loading locally saved recordings…"}
+				</p>
+				{activePage === "map" && (
+					<section className="sidebar-map-search" aria-labelledby="map-search-heading">
+						<h2 id="map-search-heading">Search map keywords</h2>
+						<section className="sidebar-area-search" aria-labelledby="area-search-heading">
+							<h3 id="area-search-heading">Explore an area</h3>
+							{areaDrawing ? (
+								<>
+									<p>Click the map to add corners. Add at least 3 points, then finish.</p>
+									<p className="sidebar-area-vertex-count">{areaVertices.length} corners added</p>
+									<div className="sidebar-area-actions">
+										<button
+											type="button"
+											onClick={() => setAreaDrawing(false)}
+											disabled={areaVertices.length < 3}
+										>
+											Finish area
+										</button>
+										<button type="button" onClick={clearArea}>Cancel</button>
+									</div>
+								</>
+							) : areaVertices.length >= 3 ? (
+								<>
+									<p className="sidebar-area-result-count">
+										{segmentsInArea.length} transcript {segmentsInArea.length === 1 ? "line segment intersects" : "line segments intersect"} this area
+									</p>
+									{areaKeywords.length > 0 ? (
+										<ul className="sidebar-area-keywords">
+											{areaKeywords.map(({ keyword, count }) => (
+												<li key={keyword}>
+													<span>{keyword}</span>
+													<span>{count}</span>
+												</li>
+											))}
+										</ul>
+									) : (
+										<p>No keywords found for transcript segments in this area.</p>
+									)}
+									<div className="sidebar-area-actions">
+										<button type="button" onClick={downloadAreaGeoJson}>Export area GeoJSON</button>
+										<button type="button" onClick={clearArea}>Clear area</button>
+									</div>
+								</>
+							) : (
+								<>
+									<p>Draw a polygon to find transcript lines that cross or lie inside it.</p>
+									<button
+										type="button"
+										className="sidebar-area-primary"
+										onClick={startAreaDrawing}
+									>
+										Draw an area
+									</button>
+								</>
+							)}
+						</section>
+						<button
+							type="button"
+							className="sidebar-map-export"
+							onClick={downloadSavedStoriesGeoJson}
+							disabled={savedStories.length === 0}
+						>
+							Export all saved line segments as GeoJSON
+						</button>
+						<label htmlFor="map-keyword-search">Search transcripts and keywords in saved stories</label>
+						<input
+							id="map-keyword-search"
+							type="search"
+							value={mapKeywordSearch}
+							onChange={(event) => setMapKeywordSearch(event.target.value)}
+							placeholder="Search transcripts or keywords…"
+						/>
+						<div className="sidebar-map-visualization" role="group" aria-label="Map search display">
+							<button
+								type="button"
+								aria-pressed={mapVisualization === "segments"}
+								className={mapVisualization === "segments" ? "is-active" : ""}
+								onClick={() => setMapVisualization("segments")}
+							>
+								Segments
+							</button>
+							<button
+								type="button"
+								aria-pressed={mapVisualization === "heatmap"}
+								className={mapVisualization === "heatmap" ? "is-active" : ""}
+								onClick={() => setMapVisualization("heatmap")}
+							>
+								Heatmap
+							</button>
+						</div>
+						<div className="sidebar-map-search-results" aria-live="polite">
+							{savedStories.length === 0 ? (
+								<p>Save a recording as a story first. Its transcript keywords and locations will be searchable here.</p>
+							) : !mapKeywordSearch.trim() ? (
+								<p>{mapVisualization === "heatmap"
+									? "Enter a search term to build a heatmap from matching transcript lines."
+									: "Search for a term to highlight matching transcripts and keywords."}</p>
+							) : matchingMapStories.length > 0 ? (
+								<>
+									<p className="sidebar-map-result-count">
+										{matchingMapSegmentCount} matching {matchingMapSegmentCount === 1 ? "segment" : "segments"} across {matchingMapStories.length} {matchingMapStories.length === 1 ? "story" : "stories"}
+									</p>
+									<ul>
+										{matchingMapStories.map((story) => (
+											<li key={story.id}>
+												<button type="button" onClick={() => openSavedStory(story.id)}>
+													{story.title}
+												</button>
+											</li>
+										))}
+									</ul>
+								</>
+							) : (
+								<p>No saved transcript or keywords match that search.</p>
+							)}
+						</div>
+					</section>
+				)}
 				{activePage === "savedStories" && (
 					<section className="sidebar-saved-stories" aria-labelledby="saved-stories-heading">
 						{selectedStory ? (
@@ -962,6 +1615,14 @@ export default function App() {
 														>
 															Rename
 														</button>
+														<button
+															type="button"
+															className="saved-story-delete"
+															onClick={() => deleteSavedStory(story)}
+															aria-label={`Delete ${story.title} and its audio`}
+														>
+															Delete
+														</button>
 													</>
 												)}
 											</li>
@@ -1018,6 +1679,7 @@ export default function App() {
 			{showStoryPrompt && (
 				<div style={styles.storyPromptBackdrop}>
 					<section
+						className="story-prompt-dialog"
 						role="dialog"
 						aria-modal="true"
 						aria-labelledby="story-prompt-title"
@@ -1026,23 +1688,45 @@ export default function App() {
 						<h2 id="story-prompt-title" style={styles.storyPromptTitle}>
 							Add story to map?
 						</h2>
+						{storySaveError && (
+							<p className="story-save-error" role="alert">
+								{storySaveError}
+								{storySaveError.includes("user_id") && storySaveError.includes("schema cache") && (
+									<>
+										{" "}Run the Supabase ownership migration once in your project's SQL Editor, then reload the app.
+									</>
+								)}
+							</p>
+						)}
 						<div style={styles.storyPromptActions}>
 							<button
 								type="button"
 								onClick={addStoryToMap}
-								disabled={savingStory}
+								disabled={savingStory || !storiesLoaded}
 								style={{ ...styles.button, ...styles.addStoryButton }}
 							>
-								{savingStory ? "Saving…" : "Add"}
+								{savingStory
+									? "Saving…"
+									: !authLoaded
+										? "Checking account…"
+										: !authUserId
+											? "Sign in to save"
+											: !storiesLoaded
+												? "Loading…"
+												: "Add"}
 							</button>
-							<button type="button" style={{ ...styles.button, ...styles.deleteStoryButton }}>
+							<button
+								type="button"
+								onClick={discardRecording}
+								style={{ ...styles.button, ...styles.deleteStoryButton }}
+							>
 								Delete
 							</button>
 						</div>
 					</section>
 				</div>
 			)}
-			<section style={styles.mapSection} aria-label="Transcript locations map">
+			<section style={styles.mapSection} aria-label="Transcript route map">
 				<div ref={mapElementRef} style={styles.map} />
 				<aside className={`map-story-sidebar${storiesExpanded ? " is-expanded" : ""}`}>
 					<button
@@ -1062,35 +1746,38 @@ export default function App() {
 									key={story.id}
 									type="button"
 									className={`map-story-name${selectedStoryId === story.id ? " is-selected" : ""}`}
-									onClick={() => setSelectedStoryId(story.id)}
+									onClick={() => openSavedStory(story.id)}
 								>
 									{story.title}
 								</button>
 							)) : (
 								<p className="map-story-empty">Stories you add will appear here.</p>
 							)}
-							{selectedStory && (
-								<aside className="map-story-transcript" aria-live="polite">
-									<h3>{selectedStory.title}</h3>
-									<p>{selectedStory.text
-										|| "No transcript was captured for this story."}</p>
-								</aside>
-							)}
 						</div>
 					)}
 				</aside>
 				<div style={styles.mapBadge}>
 					<span style={styles.mapBadgeDot} />
-					{mapPoints.length} {mapPoints.length === 1 ? "voice note" : "voice notes"}
-					{journeyReady && mapPoints.length > 1 && " · Route connected"}
-				</div>
-				{mapPoints.length === 0 && (
+					{mapSegments.length} {mapSegments.length === 1 ? "line segment" : "line segments"}
+					{journeyReady && transcriptSegments.length > 1 && " · Route connected"}				</div>
+				{activePage === "home" && mapSegments.length === 0 && (
 					<div style={styles.mapHint}>
-						<strong>Your story, pinned to the map.</strong>
-						<span>Start recording to add your first location.</span>
+						<strong>Your walk, traced on the map.</strong>
+						<span>Start recording to add your first route segment.</span>
+					</div>
+				)}
+				{activePage === "map" && mapSegments.length === 0 && (
+					<div style={styles.mapHint}>
+						<strong>No saved route segments to show yet.</strong>
+						<span>
+							{savedStories.length === 0
+								? "Save a recording as a story to search its keywords and see its route segments here."
+								: "Your saved stories do not have any transcript segments with a recorded route yet."}
+						</span>
 					</div>
 				)}
 			</section>
+			{activePage === "home" && (
 			<div style={styles.content}>
 				{journeyReady && (
 					<section style={styles.journeyCard} aria-live="polite">
@@ -1112,25 +1799,29 @@ export default function App() {
 						</p>
 					</section>
 				)}
-				{selectedPoint && (
+				{selectedSegment && (
 					<section style={styles.selectedCard} aria-live="polite">
 						<div style={styles.selectedHeader}>
 							<div>
-								<p style={styles.eyebrow}>PINNED TRANSCRIPT · NOTE {selectedPoint.index + 1}</p>
-								<h2 style={styles.selectedTitle}>Voice note</h2>
+								<p style={styles.eyebrow}>TRANSCRIPT LINE · INTERVAL {selectedSegment.index + 1}</p>
+								<h2 style={styles.selectedTitle}>Transcript segment</h2>
 							</div>
 							<button
 								type="button"
-								onClick={() => setSelectedPoint(null)}
+								onClick={() => setSelectedSegment(null)}
 								style={styles.closeButton}
 								aria-label="Close selected transcript"
 							>
 								×
 							</button>
 						</div>
-						<p style={styles.selectedTranscript}>{selectedPoint.text}</p>
+						<p style={styles.selectedTranscript}>
+							{selectedSegment.text || "No transcript was captured during this interval."}
+						</p>
 						<p style={styles.selectedCoordinates}>
-							{selectedPoint.location.latitude.toFixed(6)}, {selectedPoint.location.longitude.toFixed(6)}
+							Start: {selectedSegment.startLocation.latitude.toFixed(6)}, {selectedSegment.startLocation.longitude.toFixed(6)}
+							{" | "}
+							End: {selectedSegment.endLocation.latitude.toFixed(6)}, {selectedSegment.endLocation.longitude.toFixed(6)}
 						</p>
 					</section>
 				)}
@@ -1166,10 +1857,15 @@ export default function App() {
 												{!segment.text && !segment.interim && "No speech in this interval."}
 											</p>
 											<p style={styles.locationStatus}>
-												{segment.location
-													? `${segment.location.latitude.toFixed(6)}, ${segment.location.longitude.toFixed(6)}`
+												{segment.startLocation
+													? `Start: ${segment.startLocation.latitude.toFixed(6)}, ${segment.startLocation.longitude.toFixed(6)}`
 													: segment.locationStatus}
 											</p>
+											{segment.endLocation && (
+												<p style={styles.locationStatus}>
+													End: {segment.endLocation.latitude.toFixed(6)}, {segment.endLocation.longitude.toFixed(6)}
+												</p>
+											)}
 										</div>
 									</div>
 								);
@@ -1184,6 +1880,7 @@ export default function App() {
 				</section>
 				{audioUrl && <audio controls src={audioUrl} style={styles.audio} />}
 			</div>
+			)}
 			</main>
 		</div>
 	);
